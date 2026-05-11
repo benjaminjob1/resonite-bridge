@@ -1,48 +1,39 @@
 #!/usr/bin/env node
 /**
- * Resonite Bridge - Pi Side
- * Connects Resonite headless client to OpenClaw/BenBot for AI interaction
+ * Resonite Bridge - Pi Side (OpenClaw side)
+ * Handles two-way voice + text + visual with Resonite
  * 
  * Usage: PI_HOST=<tailscale-ip> node bridge.js
  */
 
-const WebSocket = require('ws');
+const { WebSocket } = require('ws');
 const http = require('http');
 
+// Config
 const PI_HOST = process.env.PI_HOST || 'localhost';
 const PI_PORT = process.env.PI_PORT || 8765;
-const OPENCLAW_WS = `ws://${PI_HOST}:18789`;
-const RESONITE_WS = `ws://localhost:9090`;
+const RESONITE_SERVER_WS = `ws://${PI_HOST}:8765`;
+const OPENCLAW_WS = `ws://127.0.0.1:18789`;
+const OPENCLAW_TOKEN = process.env.OPENCLAW_TOKEN || '';
 
-// Connection state
+// State
 let resoniteWs = null;
 let openclawWs = null;
+let sessionReady = false;
 
-// Resonite message types
-const RESONITE_PROTOCOLS = {
-  HELLO: 'Hello',
-  GOODBYE: 'Goodbye',
-  HEARTBEAT: 'Heartbeat',
-  COMMAND: 'Command',
-  DATA: 'Data',
-  AUDIO: 'Audio',
-  VIDEO: 'Video'
-};
-
-// Connect to Resonite headless
-function connectToResonite() {
-  console.log('🔗 Connecting to Resonite headless...');
+// Connect to Resonite Server (local side)
+function connectToResoniteServer() {
+  console.log('🔗 Connecting to Resonite Server...');
   
-  resoniteWs = new WebSocket(RESONITE_WS, {
-    headers: {
-      'Protocol-Version': '1.0',
-      'App-Name': 'BenBot-Bridge'
-    }
-  });
+  resoniteWs = new WebSocket(RESONITE_SERVER_WS);
 
   resoniteWs.on('open', () => {
-    console.log('✅ Connected to Resonite headless');
-    sendHello();
+    console.log('✅ Connected to Resonite Server');
+    resoniteWs.send(JSON.stringify({
+      type: 'Hello',
+      version: '1.0',
+      capabilities: ['voice', 'text', 'visual', 'interactive']
+    }));
   });
 
   resoniteWs.on('message', (data) => {
@@ -50,13 +41,14 @@ function connectToResonite() {
       const msg = JSON.parse(data.toString());
       handleResoniteMessage(msg);
     } catch (e) {
-      console.log('Raw Resonite data:', data.toString('hex', 0, 100));
+      // Raw audio data
+      handleRawAudio(data);
     }
   });
 
   resoniteWs.on('close', () => {
-    console.log('❌ Resonite disconnected');
-    setTimeout(connectToResonite, 5000);
+    console.log('❌ Resonite Server disconnected');
+    setTimeout(connectToResoniteServer, 5000);
   });
 
   resoniteWs.on('error', (err) => {
@@ -64,107 +56,76 @@ function connectToResonite() {
   });
 }
 
-// Send hello to Resonite
-function sendHello() {
-  if (resoniteWs && resoniteWs.readyState === 1) {
-    resoniteWs.send(JSON.stringify({
-      type: RESONITE_PROTOCOLS.HELLO,
-      version: '1.0',
-      capabilities: ['voice', 'visual', 'text', 'commands']
-    }));
-  }
-}
-
 // Handle messages from Resonite
 function handleResoniteMessage(msg) {
-  console.log('[Resonite]', msg.type, msg.data ? '(data)' : '');
+  console.log('[Resonite]', msg.type);
   
   switch (msg.type) {
-    case RESONITE_PROTOCOLS.AUDIO:
-      // Forward audio to OpenClaw for processing
-      if (openclawWs && openclawWs.readyState === 1) {
+    case 'Hello':
+      console.log('   Resonite connected, capabilities:', msg.capabilities);
+      break;
+      
+    case 'Audio':
+      // Raw audio from Resonite (PCM 16-bit 24kHz)
+      if (openclawWs && openclawWs.readyState === 1 && sessionReady) {
+        // Forward audio to OpenClaw Realtime API
         openclawWs.send(JSON.stringify({
-          type: 'resonite_audio',
-          audio: msg.audio,
-          timestamp: Date.now()
+          type: 'input_audio_buffer.append',
+          audio: msg.data // base64 encoded
         }));
       }
       break;
       
-    case RESONITE_PROTOCOLS.VIDEO:
-      // Forward video/visual data to OpenClaw
+    case 'Text':
+      // Text message from Resonite user
+      if (openclawWs && openclawWs.readyState === 1 && sessionReady) {
+        openclawWs.send(JSON.stringify({
+          type: 'conversation.item.create',
+          item: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: msg.text }]
+          }
+        }));
+        openclawWs.send(JSON.stringify({ type: 'response.create' }));
+      }
+      break;
+      
+    case 'Visual':
+      // Visual data (screenshot, world state)
       if (openclawWs && openclawWs.readyState === 1) {
         openclawWs.send(JSON.stringify({
-          type: 'resonite_video',
-          frame: msg.frame,
-          timestamp: Date.now()
+          type: 'visual_input',
+          data: msg.data
         }));
       }
       break;
       
-    case RESONITE_PROTOCOLS.DATA:
-      // Forward world/object state to OpenClaw
+    case 'Interactive':
+      // World object interaction data
       if (openclawWs && openclawWs.readyState === 1) {
         openclawWs.send(JSON.stringify({
-          type: 'resonite_data',
-          data: msg.data,
-          timestamp: Date.now()
+          type: 'interactive_data',
+          data: msg.data
         }));
       }
       break;
       
-    case RESONITE_PROTOCOLS.COMMAND:
-      // Execute command in Resonite
-      executeResoniteCommand(msg.command, msg.args);
-      break;
-      
-    case RESONITE_PROTOCOLS.HEARTBEAT:
-      resoniteWs.send(JSON.stringify({ type: RESONITE_PROTOCOLS.HEARTBEAT }));
+    case 'Ping':
+      resoniteWs.send(JSON.stringify({ type: 'Pong' }));
       break;
   }
 }
 
-// Execute command in Resonite world
-function executeResoniteCommand(cmd, args) {
-  console.log(`Executing Resonite command: ${cmd}`, args);
-  
-  const commands = {
-    speak: (text) => {
-      // Use OpenClaw TTS to generate speech
-      if (openclawWs && openclawWs.readyState === 1) {
-        openclawWs.send(JSON.stringify({
-          type: 'tts_request',
-          text: text,
-          callback: 'resonite_speak'
-        }));
-      }
-    },
-    show: (visual) => {
-      // Display visual in Resonite
-      sendToResonite({
-        type: 'DisplayVisual',
-        data: visual
-      });
-    },
-    interact: (obj) => {
-      // Interact with object
-      sendToResonite({
-        type: 'ObjectInteraction',
-        objectId: obj.id,
-        action: obj.action
-      });
-    }
-  };
-  
-  if (commands[cmd]) {
-    commands[cmd](args);
-  }
-}
-
-// Send to Resonite
-function sendToResonite(data) {
-  if (resoniteWs && resoniteWs.readyState === 1) {
-    resoniteWs.send(JSON.stringify(data));
+// Handle raw audio data
+function handleRawAudio(data) {
+  if (openclawWs && openclawWs.readyState === 1 && sessionReady) {
+    // Forward raw audio buffer
+    const base64 = data.toString('base64');
+    openclawWs.send(JSON.stringify({
+      type: 'input_audio_buffer.append',
+      audio: base64
+    }));
   }
 }
 
@@ -173,15 +134,13 @@ function connectToOpenClaw() {
   console.log('🔗 Connecting to OpenClaw...');
   
   openclawWs = new WebSocket(OPENCLAW_WS, {
-    headers: {
-      'Authorization': `Bearer ${process.env.OPENCLAW_TOKEN || ''}`
-    }
+    headers: { 'Authorization': `Bearer ${OPENCLAW_TOKEN}` }
   });
 
   openclawWs.on('open', () => {
     console.log('✅ Connected to OpenClaw');
     openclawWs.send(JSON.stringify({
-      type: 'session_attach',
+      type: 'session.attach',
       sessionId: 'resonite-bridge'
     }));
   });
@@ -197,6 +156,8 @@ function connectToOpenClaw() {
 
   openclawWs.on('close', () => {
     console.log('❌ OpenClaw disconnected');
+    openclawWs = null;
+    sessionReady = false;
     setTimeout(connectToOpenClaw, 5000);
   });
 
@@ -207,40 +168,56 @@ function connectToOpenClaw() {
 
 // Handle messages from OpenClaw
 function handleOpenClawMessage(msg) {
-  console.log('[OpenClaw]', msg.type);
+  // Handle audio response from AI
+  if (msg.type === 'session.created') {
+    sessionReady = true;
+    console.log('🎙️ OpenClaw session ready - can receive audio');
+  }
   
-  if (msg.type === 'ai_response') {
-    // AI responded - send to Resonite as speech
-    sendToResonite({
-      type: 'Speak',
-      text: msg.text
-    });
-  } else if (msg.type === 'visual_response') {
-    // Visual response - display in Resonite
-    sendToResonite({
-      type: 'DisplayVisual',
-      visual: msg.visual
-    });
-  } else if (msg.type === 'resonite_speak') {
-    // TTS response - forward as audio
-    sendToResonite({
-      type: 'PlayAudio',
-      audio: msg.audio
-    });
+  if (msg.type === 'response.audio.delta' || msg.type === 'audio_delta') {
+    // AI voice response - send to Resonite
+    const audio = msg.delta || msg.audio;
+    if (resoniteWs && resoniteWs.readyState === 1) {
+      resoniteWs.send(JSON.stringify({
+        type: 'PlayAudio',
+        audio: audio,
+        spatial: true
+      }));
+    }
+  }
+  
+  if (msg.type === 'response.done' || msg.type === 'response_complete') {
+    console.log('✅ AI response complete');
+  }
+  
+  if (msg.type === 'conversation.item.input_audio_transcription.completed') {
+    console.log('📝 Transcript:', msg.transcript);
+  }
+  
+  if (msg.type === 'error') {
+    console.error('OpenClaw error:', msg.message);
   }
 }
 
 // Heartbeat
 setInterval(() => {
   if (resoniteWs && resoniteWs.readyState === 1) {
-    resoniteWs.send(JSON.stringify({ type: RESONITE_PROTOCOLS.HEARTBEAT }));
+    resoniteWs.send(JSON.stringify({ type: 'Heartbeat' }));
   }
-}, 30000);
+}, 25000);
 
 // Start
 console.log('🎙️ Resonite Bridge starting...');
-console.log(`   Resonite WS: ${RESONITE_WS}`);
-console.log(`   OpenClaw WS: ${OPENCLAW_WS}`);
+console.log(`   Resonite Server: ${RESONITE_SERVER_WS}`);
+console.log(`   OpenClaw Gateway: ${OPENCLAW_WS}`);
 
-connectToResonite();
+connectToResoniteServer();
 connectToOpenClaw();
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\n🛑 Shutting down...');
+  if (resoniteWs) resoniteWs.close();
+  if (openclawWs) openclawWs.close();
+  process.exit(0);
+});
