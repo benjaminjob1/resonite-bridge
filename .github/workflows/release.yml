@@ -28,7 +28,6 @@ jobs:
         run: |
           mkdir -p dist
           cp bridge.js dist/
-          cp server.js dist/
           cp package.json dist/
           cp README.md dist/
 
