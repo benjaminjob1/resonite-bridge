@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Create distribution
+        run: |
+          mkdir -p dist
+          cp bridge.js dist/
+          cp server.js dist/
+          cp package.json dist/
+          cp README.md dist/
+
+      - name: Create archive
+        run: |
+          cd dist
+          zip -r ../resonite-bridge-${{ github.ref_name }}.zip .
+          cd ..
+          tar -czf resonite-bridge-${{ github.ref_name }}-any.tar.gz -C dist .
+
+      - name: Create checksums
+        run: sha256sum resonite-bridge-*.zip resonite-bridge-*.tar.gz
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*
+            resonite-bridge-*.zip
+            resonite-bridge-*.tar.gz
+            checksums.txt
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
