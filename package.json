@@ -1,0 +1,13 @@
+{
+  "name": "resonite-bridge",
+  "version": "1.0.0",
+  "description": "Bridge to connect BenBot/OpenClaw to Resonite for voice, visual, and interactive capabilities",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js",
+    "server": "node server.js"
+  },
+  "keywords": ["resonite", "ai", "voice", "bridge"],
+  "author": "BenBot",
+  "license": "MIT"
+}
